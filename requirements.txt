@@ -87,3 +87,4 @@ wcwidth==0.2.13
 yarl==1.9.11
 autogen==0.3.0
 semantic-kernel>=1.6.0
+chromadb==1.0.17

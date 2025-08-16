@@ -1,5 +1,6 @@
 import os
 import asyncio
+import re
 from typing import Annotated
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
@@ -69,27 +70,90 @@ chat_service = OpenAIChatCompletion(
 )
 
 # ---------------------------
+# Database utilities
+# ---------------------------
+def check_database_connection():
+    """Check if database connection is healthy and reset if needed."""
+    try:
+        with db.connect() as conn:
+            # Simple test query
+            conn.execute(text("SELECT 1")).fetchone()
+            return True
+    except Exception as e:
+        print(f"Database connection issue: {e}")
+        # Try to reset the connection pool
+        db.dispose()
+        return False
+
+def reset_database_connection():
+    """Reset the database connection pool."""
+    try:
+        db.dispose()
+        print("Database connection pool reset")
+        return True
+    except Exception as e:
+        print(f"Error resetting database connection: {e}")
+        return False
+
+# ---------------------------
 # HR Plugin Definition
 # ---------------------------
 class HRPlugin:
     @kernel_function(
-        description="Gets the leave balance for a specific employee from the database. Use this when users ask about remaining leave days, vacation balance, or time off for a specific person."
+        description="Gets the number of leave days used by a specific employee from the database. ALWAYS call this function when users ask about a specific person's leave usage or balance. You must extract the employee name from the user's question and pass it as the employee_name parameter."
     )
-    def get_leave_balance(
-        self, employee_name: Annotated[str, "The name of the employee to check leave balance for"]
-    ) -> Annotated[str, "Returns the leave balance information for the employee"]:
-        """Fetch leave balance from Postgres."""
+    def get_leave_used(
+        self, employee_name: Annotated[str, "The name of the employee to check leave usage for"]
+    ) -> Annotated[str, "Returns the number of leave days used by the employee"]:
+        """Fetch leaves used by the employee from PostgreSQL database."""
         try:
+            # Check database connection health first
+            if not check_database_connection():
+                return "Database connection unavailable. Please try again."
+            
+            # Use autocommit for simple read operations to avoid transaction issues
             with db.connect() as conn:
+                # Enable autocommit mode for this connection
+                conn = conn.execution_options(autocommit=True)
+                
                 result = conn.execute(
-                    text("SELECT balance FROM leaves WHERE employee = :emp"),
+                    text("SELECT leaves_taken_current_year FROM employee_leaves WHERE employee_name = :emp"),
                     {"emp": employee_name}
                 ).fetchone()
+                
                 if result:
-                    return f"{employee_name} has {result[0]} days of annual leave remaining."
+                    leaves_used = result[0]
+                    return f"{employee_name} has used {leaves_used} days of annual leave this year."
                 return f"No leave record found for {employee_name}."
+                    
         except Exception as e:
-            return f"Error retrieving leave balance: {str(e)}"
+            # If we get a transaction error, try to reset the connection
+            if "InFailedSqlTransaction" in str(e):
+                reset_database_connection()
+                return f"Database transaction error occurred. Connection reset. Please try again: {str(e)}"
+            return f"Error retrieving leave usage: {str(e)}"
+
+    @kernel_function(
+        description="Gets the total annual leave entitlement for employees from company policies. Call this function when you need to know how many total leave days employees are entitled to per year."
+    )
+    def get_total_leave_entitlement(
+        self
+    ) -> Annotated[str, "Returns the total annual leave entitlement for employees"]:
+        """Fetch total annual leave entitlement from ChromaDB policies."""
+        try:
+            # Query ChromaDB for annual leave policy
+            policy_results = collection.query(
+                query_texts=["annual leave entitlement days per year total allowed"],
+                n_results=1
+            )
+            
+            if policy_results["documents"]:
+                policy_text = policy_results["documents"][0][0]
+                return f"Company policy: {policy_text}"
+            return "No leave entitlement policy found."
+                    
+        except Exception as e:
+            return f"Error retrieving leave entitlement policy: {str(e)}"
 
     @kernel_function(
         description="Searches company HR policies and procedures. Use this for questions about leave policies, company rules, entitlements, procedures, or general HR information."
@@ -98,6 +162,21 @@ class HRPlugin:
         self, query: Annotated[str, "The policy question or topic to search for"]
     ) -> Annotated[str, "Returns relevant policy information"]:
         """Fetch policy info from ChromaDB."""
+        try:
+            results = collection.query(query_texts=[query], n_results=1)
+            if results["documents"]:
+                return results["documents"][0][0]
+            return "No relevant policy found."
+        except Exception as e:
+            return f"Error retrieving policy information: {str(e)}"
+
+    @kernel_function(
+        description="Searches company HR policies and procedures. Use this for questions about leave policies, company rules, entitlements, procedures, or general HR information that doesn't involve a specific employee's personal balance."
+    )
+    def query_policy_for_employee(
+        self, employee_name: Annotated[str, "The name of the employee to check leave balance for"], query: Annotated[str, "The policy question or topic to search for"]
+    ) -> Annotated[str, "Returns relevant policy information"]:
+        """Fetch policy info from ChromaDB for a specific employee."""
         try:
             results = collection.query(query_texts=[query], n_results=1)
             if results["documents"]:
@@ -121,15 +200,26 @@ async def rag_query_semantic(user_query: str) -> str:
     try:
         chat_history = ChatHistory()
         
-        # System message to set context and behavior
+        # Enhanced system message for better parameter extraction
         chat_history.add_system_message(
-            "You are an HR assistant that helps employees with leave-related questions and HR policies. "
-            "ALWAYS use the available functions to get accurate, up-to-date information. "
-            "For leave balance questions, use get_leave_balance with the employee name. "
-            "For policy questions, use query_policy. "
-            "Extract employee names from questions when needed. "
-            "Provide helpful, accurate responses based on the function results. "
-            "If the information is not available, clearly state that."
+            "You are an HR assistant with access to these functions:\n\n"
+            "1. get_leave_used(employee_name): Gets how many leave days an employee has used\n"
+            "   - ALWAYS extract the employee name from the user's question\n"
+            "   - Returns only the USED days, not remaining\n\n"
+            "2. get_total_leave_entitlement(): Gets the total annual leave days employees are entitled to\n"
+            "   - Returns the company policy on total leave allowance\n\n"
+            "3. query_policy(query): Searches general HR policies and procedures\n"
+            "   - For questions about policies, rules, procedures\n\n"
+            "INTELLIGENT LEAVE BALANCE CALCULATION:\n"
+            "When users ask about remaining leave days (like 'How many days does Alice have left?'):\n"
+            "1. Call get_leave_used('Alice') to get used days\n"
+            "2. Call get_total_leave_entitlement() to get total allowance\n"
+            "3. Calculate remaining = total - used and provide a complete answer\n\n"
+            "CRITICAL RULES:\n"
+            "- When a user mentions ANY person's name asking about leave balance, call BOTH functions\n"
+            "- Always extract names from questions like 'Alice', 'Bob', 'Charlie', etc.\n"
+            "- Use the data from both sources to calculate and explain the remaining balance\n"
+            "- If no specific person is mentioned, use query_policy for general information"
         )
         
         chat_history.add_user_message(user_query)
@@ -214,9 +304,9 @@ if __name__ == "__main__":
     print("=== Testing Semantic Kernel RAG System ===\n")
     
     # Example 1: Leave balance query (Semantic Kernel will route to get_leave_balance)
-    print("1. Testing leave balance query:")
-    result1 = rag_query("How many leave days does Alice have left?")
-    print(f"Result: {result1}\n")
+    # print("1. Testing leave balance query:")
+    # result1 = rag_query("How many leave days does Alice have left?")
+    # print(f"Result: {result1}\n")
 
     # Example 2: Policy query (Semantic Kernel will route to query_policy)
     print("2. Testing policy query:")
